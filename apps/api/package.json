@@ -1,0 +1,20 @@
+{
+  "name": "@payment/api",
+  "version": "1.0.0",
+  "description": "Express API service for Mini Payment System",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@payment/database": "*",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21"
+  }
+}
+

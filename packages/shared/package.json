@@ -1,0 +1,12 @@
+{
+  "name": "@payment/shared",
+  "version": "1.0.0",
+  "description": "Shared types, event schemas, constants, and utilities",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {}
+}
+

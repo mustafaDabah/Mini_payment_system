@@ -1,0 +1,23 @@
+{
+  "name": "payment-system",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mini payment system for backend system design practice",
+  "workspaces": [
+    "apps/api",
+    "packages/database"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev --workspace=@payment/api",
+    "build:api": "npm run build --workspace=@payment/api",
+    "infra:up": "docker compose up -d postgres",
+    "infra:down": "docker compose down",
+    "infra:logs": "docker compose logs -f postgres"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}
+

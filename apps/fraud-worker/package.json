@@ -1,0 +1,19 @@
+{
+  "name": "@payment/fraud-worker",
+  "version": "1.0.0",
+  "description": "Kafka consumer worker evaluating transaction fraud risk in near real-time",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@payment/database": "*",
+    "@payment/kafka": "*",
+    "@payment/shared": "*",
+    "dotenv": "^16.4.5",
+    "ioredis": "^5.4.1"
+  }
+}
+
