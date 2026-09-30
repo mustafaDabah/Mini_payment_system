@@ -10,7 +10,8 @@
   "scripts": {
     "dev:api": "npm run dev --workspace=@payment/api",
     "build:api": "npm run build --workspace=@payment/api",
-    "infra:up": "docker compose up -d postgres",
+    "db:init": "tsx packages/database/src/init.ts",
+    "infra:up": "docker compose up -d postgres dbgate",
     "infra:down": "docker compose down",
     "infra:logs": "docker compose logs -f postgres"
   },

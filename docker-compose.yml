@@ -104,6 +104,30 @@ services:
       kafka:
         condition: service_healthy
 
+  # ----------------------------------------------------------------------------
+  # 5. DBGate: Web-Based Database Administration GUI for PostgreSQL
+  # ----------------------------------------------------------------------------
+  dbgate:
+    image: dbgate/dbgate:latest
+    container_name: payment-dbgate
+    restart: unless-stopped
+    ports:
+      - "${DBGATE_PORT:-8081}:3000"
+    environment:
+      CONNECTIONS: postgres
+      LABEL_postgres: "Payment PostgreSQL"
+      SERVER_postgres: postgres
+      PORT_postgres: 5432
+      USER_postgres: ${POSTGRES_USER:-postgres}
+      PASSWORD_postgres: ${POSTGRES_PASSWORD:-postgres}
+      DATABASE_postgres: ${POSTGRES_DB:-payment_db}
+      ENGINE_postgres: postgres@dbgate-plugin-postgres
+    networks:
+      - payment-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 # ------------------------------------------------------------------------------
 # Isolated Bridge Network for Inter-Container Communication
 # ------------------------------------------------------------------------------
