@@ -28,6 +28,7 @@
   },
   "include": [
     "apps/api/src/**/*",
-    "packages/database/src/**/*"
+    "packages/database/src/**/*",
+    "scripts/**/*"
   ]
 }

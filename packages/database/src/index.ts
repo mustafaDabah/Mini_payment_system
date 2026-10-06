@@ -41,6 +41,16 @@ pool.on("error", (err) => {
 // TypeScript Types
 // ------------------------------------------------------------------------------
 
+export class TransferError extends Error {
+  constructor(
+    message: string,
+    public statusCode: number = 400
+  ) {
+    super(message);
+    this.name = "TransferError";
+  }
+}
+
 export type PaymentCurrency = "USD" | "EUR" | "GBP";
 export type PaymentStatus = "PENDING" | "COMPLETED" | "FAILED";
 
@@ -210,6 +220,130 @@ export async function createPayment(params: CreatePaymentParams): Promise<Paymen
   );
 
   return result.rows[0];
+}
+
+/**
+ * Executes an atomic transfer between two accounts within a single PostgreSQL transaction.
+ *
+ * Implements deterministic lock ordering (smaller UUID first) to prevent deadlocks under concurrency.
+ */
+export async function executeTransferPayment(
+  params: CreatePaymentParams
+): Promise<Payment> {
+  const { source_account_id, destination_account_id, amount, currency } = params;
+  const transferAmount = Number(amount);
+
+  if (source_account_id === destination_account_id) {
+    throw new TransferError("Source and destination accounts cannot be the same", 400);
+  }
+
+  if (isNaN(transferAmount) || transferAmount <= 0) {
+    throw new TransferError("Payment amount must be greater than zero", 400);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    // 0. Begin Transaction
+    await client.query("BEGIN");
+
+    // 1. Determine deterministic lock order using account UUIDs (smaller UUID first)
+    const [firstLockId, secondLockId] =
+      source_account_id < destination_account_id
+        ? [source_account_id, destination_account_id]
+        : [destination_account_id, source_account_id];
+
+    // 2. SELECT both account rows using SELECT ... FOR UPDATE in deterministic order
+    const firstRes = await client.query<Account>(
+      "SELECT id, balance, currency, created_at FROM accounts WHERE id = $1 FOR UPDATE",
+      [firstLockId]
+    );
+
+    const secondRes = await client.query<Account>(
+      "SELECT id, balance, currency, created_at FROM accounts WHERE id = $1 FOR UPDATE",
+      [secondLockId]
+    );
+
+    const accountMap = new Map<string, Account>();
+    if (firstRes.rows[0]) accountMap.set(firstRes.rows[0].id, firstRes.rows[0]);
+    if (secondRes.rows[0]) accountMap.set(secondRes.rows[0].id, secondRes.rows[0]);
+
+    const sourceAccount = accountMap.get(source_account_id);
+    const destinationAccount = accountMap.get(destination_account_id);
+
+    // 3. Validate that both accounts exist
+    if (!sourceAccount) {
+      throw new TransferError(`Source account '${source_account_id}' not found`, 404);
+    }
+    if (!destinationAccount) {
+      throw new TransferError(`Destination account '${destination_account_id}' not found`, 404);
+    }
+
+    // 4. Validate that the source account has sufficient balance
+    const sourceBalance = Number(sourceAccount.balance);
+    if (sourceBalance < transferAmount) {
+      throw new TransferError(
+        `Insufficient balance: source account balance is ${sourceAccount.balance} ${sourceAccount.currency}, required ${transferAmount.toFixed(2)} ${currency}`,
+        400
+      );
+    }
+
+    // 5. Validate currencies according to business rules
+    if (sourceAccount.currency !== currency) {
+      throw new TransferError(
+        `Currency mismatch: source account currency is ${sourceAccount.currency}, payment currency is ${currency}`,
+        400
+      );
+    }
+    if (destinationAccount.currency !== currency) {
+      throw new TransferError(
+        `Currency mismatch: destination account currency is ${destinationAccount.currency}, payment currency is ${currency}`,
+        400
+      );
+    }
+
+    // 6. Deduct payment amount from source account
+    await client.query(
+      "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
+      [transferAmount, source_account_id]
+    );
+
+    // 7. Add payment amount to destination account
+    await client.query(
+      "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+      [transferAmount, destination_account_id]
+    );
+
+    // 8. Insert payment record with status COMPLETED
+    const paymentResult = await client.query<Payment>(
+      `INSERT INTO payments (
+         source_account_id,
+         destination_account_id,
+         amount,
+         currency,
+         status
+       )
+       VALUES ($1, $2, $3, $4, 'COMPLETED')
+       RETURNING id, source_account_id, destination_account_id, amount, currency, status, created_at`,
+      [source_account_id, destination_account_id, transferAmount, currency]
+    );
+
+    // 9. COMMIT transaction
+    await client.query("COMMIT");
+
+    return paymentResult.rows[0];
+  } catch (error) {
+    // If any step fails, ROLLBACK the entire transaction
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErr) {
+      console.error("[database] Failed to rollback transaction:", rollbackErr);
+    }
+    throw error;
+  } finally {
+    // Release client back to the connection pool
+    client.release();
+  }
 }
 
 export async function getPaymentById(id: string): Promise<Payment | null> {

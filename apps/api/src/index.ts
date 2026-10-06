@@ -16,6 +16,8 @@ import {
   checkDatabaseConnection,
   closeDatabaseConnection,
   createPayment,
+  executeTransferPayment,
+  TransferError,
   getPaymentById,
   listPayments,
   createAccount,
@@ -183,8 +185,8 @@ app.post("/payments", async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Create payment record (initial status: PENDING)
-    const payment = await createPayment({
+    // 2. Execute atomic transfer transaction (deterministic locking, validations, balance mutations, COMPLETED status)
+    const payment = await executeTransferPayment({
       source_account_id,
       destination_account_id,
       amount: numericAmount,
@@ -193,8 +195,12 @@ app.post("/payments", async (req: Request, res: Response) => {
     });
 
     console.log(`[api] Payment created: ${payment.id} (${payment.amount} ${payment.currency})`);
+    console.log(`[api] Payment completed atomically: ${payment.id} (${payment.amount} ${payment.currency})`);
     return res.status(201).json(payment);
   } catch (error) {
+    if (error instanceof TransferError) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
     console.error("[api] Error creating payment:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
