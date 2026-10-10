@@ -132,6 +132,13 @@ app.get("/accounts/:id", async (req: Request, res: Response) => {
  */
 app.post("/payments", async (req: Request, res: Response) => {
   try {
+    const idempotencyKey = req.header("Idempotency-Key");
+
+    // 1. Validate required Idempotency-Key header
+    if (!idempotencyKey || typeof idempotencyKey !== "string" || idempotencyKey.trim() === "") {
+      return res.status(400).json({ error: "Idempotency-Key header is required" });
+    }
+
     const {
       source_account_id,
       destination_account_id,
@@ -140,6 +147,7 @@ app.post("/payments", async (req: Request, res: Response) => {
     } = req.body;
 
     // 1. Validate required fields
+    // 2. Validate required request body fields
     if (!source_account_id || typeof source_account_id !== "string") {
       return res.status(400).json({ error: "source_account_id is required" });
     }
@@ -186,7 +194,9 @@ app.post("/payments", async (req: Request, res: Response) => {
     }
 
     // 2. Execute atomic transfer transaction (deterministic locking, validations, balance mutations, COMPLETED status)
+    // 3. Execute atomic transfer with idempotency protection
     const payment = await executeTransferPayment({
+      idempotency_key: idempotencyKey.trim(),
       source_account_id,
       destination_account_id,
       amount: numericAmount,
@@ -196,6 +206,7 @@ app.post("/payments", async (req: Request, res: Response) => {
 
     console.log(`[api] Payment created: ${payment.id} (${payment.amount} ${payment.currency})`);
     console.log(`[api] Payment completed atomically: ${payment.id} (${payment.amount} ${payment.currency})`);
+    console.log(`[api] Payment processed: ${payment.id} (Idempotency-Key: ${payment.idempotency_key}, Amount: ${payment.amount} ${payment.currency})`);
     return res.status(201).json(payment);
   } catch (error) {
     if (error instanceof TransferError) {

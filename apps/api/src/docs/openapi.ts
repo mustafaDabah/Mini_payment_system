@@ -188,7 +188,20 @@ export const openApiSpec = {
         tags: ["Payments"],
         summary: "Create and execute an atomic payment transfer",
         description:
-          "Atomically transfers funds from source to destination account using deterministic row-level locks (SELECT ... FOR UPDATE). Records payment as COMPLETED.",
+          "Atomically transfers funds from source to destination account using deterministic row-level locks (SELECT ... FOR UPDATE). Enforces idempotency via the required Idempotency-Key header.",
+        parameters: [
+          {
+            name: "Idempotency-Key",
+            in: "header",
+            required: true,
+            description: "Client-generated unique key (UUID) to guarantee idempotent payment execution on network retries.",
+            schema: {
+              type: "string",
+              format: "uuid",
+              example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+            },
+          },
+        ],
         requestBody: {
           required: true,
           content: {
@@ -201,7 +214,7 @@ export const openApiSpec = {
         },
         responses: {
           "201": {
-            description: "Payment executed atomically and completed",
+            description: "Payment executed atomically and completed (or existing payment returned for idempotent retry)",
             content: {
               "application/json": {
                 schema: {
@@ -211,13 +224,19 @@ export const openApiSpec = {
             },
           },
           "400": {
-            description: "Validation or business error (insufficient balance, currency mismatch, invalid amount)",
+            description: "Validation or business error (missing Idempotency-Key, insufficient balance, currency mismatch, invalid amount)",
             content: {
               "application/json": {
                 schema: {
                   $ref: "#/components/schemas/ErrorResponse",
                 },
                 examples: {
+                  missing_key: {
+                    summary: "Missing Idempotency-Key header",
+                    value: {
+                      error: "Idempotency-Key header is required",
+                    },
+                  },
                   insufficient_balance: {
                     summary: "Insufficient balance",
                     value: {
@@ -240,6 +259,24 @@ export const openApiSpec = {
               "application/json": {
                 schema: {
                   $ref: "#/components/schemas/ErrorResponse",
+                },
+              },
+            },
+          },
+          "409": {
+            description: "Idempotency key conflict: the key was previously used with different payment parameters",
+            content: {
+              "application/json": {
+                schema: {
+                  $ref: "#/components/schemas/ErrorResponse",
+                },
+                examples: {
+                  idempotency_conflict: {
+                    summary: "Parameter mismatch for existing idempotency key",
+                    value: {
+                      error: "Idempotency key conflict: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d' was previously used with different payment parameters",
+                    },
+                  },
                 },
               },
             },
@@ -393,6 +430,13 @@ export const openApiSpec = {
             type: "string",
             format: "uuid",
             example: "e4b6e5e0-7c64-4e4b-9721-827dbd761234",
+            description: "Backend-generated unique payment ID",
+          },
+          idempotency_key: {
+            type: "string",
+            format: "uuid",
+            example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+            description: "Client-provided idempotency key",
           },
           source_account_id: {
             type: "string",
@@ -424,6 +468,7 @@ export const openApiSpec = {
         },
         required: [
           "id",
+          "idempotency_key",
           "source_account_id",
           "destination_account_id",
           "amount",
