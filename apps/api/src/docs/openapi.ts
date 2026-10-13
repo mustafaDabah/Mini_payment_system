@@ -368,6 +368,118 @@ export const openApiSpec = {
         },
       },
     },
+    "/payments/{id}/fraud-decision": {
+      post: {
+        tags: ["Payments"],
+        summary: "Apply fraud evaluation decision",
+        description: "Applies a fraud check decision (APPROVED, REJECTED, REVIEW). Finalizes transfer or releases reserved funds.",
+        parameters: [
+          {
+            name: "id",
+            in: "path",
+            required: true,
+            description: "Payment UUID",
+            schema: {
+              type: "string",
+              format: "uuid",
+              example: "e4b6e5e0-7c64-4e4b-9721-827dbd761234",
+            },
+          },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                $ref: "#/components/schemas/FraudDecisionRequest",
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Fraud decision applied successfully",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    payment: { $ref: "#/components/schemas/Payment" },
+                    reservation: { $ref: "#/components/schemas/Reservation" },
+                  },
+                },
+              },
+            },
+          },
+          "400": {
+            description: "Invalid decision or invalid payment state",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "404": {
+            description: "Payment not found",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+          "409": {
+            description: "Transition conflict (e.g. rejecting an already completed payment)",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ErrorResponse" },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/payments/{id}/reservation": {
+      get: {
+        tags: ["Payments"],
+        summary: "Get reservation details for payment",
+        description: "Retrieves the active, consumed, or released fund reservation associated with the payment.",
+        parameters: [
+          {
+            name: "id",
+            in: "path",
+            required: true,
+            description: "Payment UUID",
+            schema: {
+              type: "string",
+              format: "uuid",
+              example: "e4b6e5e0-7c64-4e4b-9721-827dbd761234",
+            },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Reservation details",
+            content: {
+              "application/json": {
+                schema: {
+                  $ref: "#/components/schemas/Reservation",
+                },
+              },
+            },
+          },
+          "404": {
+            description: "Reservation not found",
+            content: {
+              "application/json": {
+                schema: {
+                  $ref: "#/components/schemas/ErrorResponse",
+                },
+              },
+            },
+          },
+        },
+      },
+    },
   },
   components: {
     schemas: {
@@ -379,9 +491,22 @@ export const openApiSpec = {
       },
       PaymentStatus: {
         type: "string",
-        enum: ["PENDING", "COMPLETED", "FAILED"],
+        enum: [
+          "PENDING",
+          "PENDING_FRAUD_CHECK",
+          "COMPLETED",
+          "FAILED",
+          "FRAUD_REJECTED",
+          "UNDER_REVIEW",
+        ],
         description: "Lifecycle status of a payment",
-        example: "COMPLETED",
+        example: "PENDING_FRAUD_CHECK",
+      },
+      ReservationStatus: {
+        type: "string",
+        enum: ["ACTIVE", "CONSUMED", "RELEASED"],
+        description: "Lifecycle status of a fund reservation",
+        example: "ACTIVE",
       },
       Account: {
         type: "object",
@@ -396,6 +521,11 @@ export const openApiSpec = {
             example: "1000.00",
             description: "Account balance formatted as decimal string",
           },
+          reserved_balance: {
+            type: "string",
+            example: "0.00",
+            description: "Held/reserved balance pending fraud evaluation",
+          },
           currency: {
             $ref: "#/components/schemas/Currency",
           },
@@ -405,7 +535,7 @@ export const openApiSpec = {
             example: "2026-10-04T12:00:00.000Z",
           },
         },
-        required: ["id", "balance", "currency", "created_at"],
+        required: ["id", "balance", "reserved_balance", "currency", "created_at"],
       },
       CreateAccountRequest: {
         type: "object",
@@ -528,6 +658,65 @@ export const openApiSpec = {
           },
         },
         required: ["error"],
+      },
+      FraudDecisionRequest: {
+        type: "object",
+        required: ["decision"],
+        properties: {
+          decision: {
+            type: "string",
+            enum: ["APPROVED", "REJECTED", "REVIEW"],
+            example: "APPROVED",
+            description: "Fraud evaluation decision",
+          },
+          reason: {
+            type: "string",
+            example: "Low risk velocity and clean historical transaction profile",
+            description: "Optional descriptive reason for fraud evaluation",
+          },
+        },
+      },
+      Reservation: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            format: "uuid",
+            example: "f1a2b3c4-d5e6-7890-abcd-ef1234567890",
+          },
+          payment_id: {
+            type: "string",
+            format: "uuid",
+            example: "e4b6e5e0-7c64-4e4b-9721-827dbd761234",
+          },
+          account_id: {
+            type: "string",
+            format: "uuid",
+            example: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+          },
+          amount: {
+            type: "string",
+            example: "300.00",
+          },
+          currency: {
+            $ref: "#/components/schemas/Currency",
+          },
+          status: {
+            $ref: "#/components/schemas/ReservationStatus",
+            example: "ACTIVE",
+          },
+          created_at: {
+            type: "string",
+            format: "date-time",
+            example: "2026-10-04T12:00:00.000Z",
+          },
+          updated_at: {
+            type: "string",
+            format: "date-time",
+            example: "2026-10-04T12:00:00.000Z",
+          },
+        },
+        required: ["id", "payment_id", "account_id", "amount", "currency", "status", "created_at", "updated_at"],
       },
     },
   },

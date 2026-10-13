@@ -52,11 +52,20 @@ export class TransferError extends Error {
 }
 
 export type PaymentCurrency = "USD" | "EUR" | "GBP";
-export type PaymentStatus = "PENDING" | "COMPLETED" | "FAILED";
+export type PaymentStatus =
+  | "PENDING"
+  | "PENDING_FRAUD_CHECK"
+  | "COMPLETED"
+  | "FAILED"
+  | "FRAUD_REJECTED"
+  | "UNDER_REVIEW";
+
+export type ReservationStatus = "ACTIVE" | "CONSUMED" | "RELEASED";
 
 export interface Account {
   id: string;
   balance: string;
+  reserved_balance: string;
   currency: PaymentCurrency;
   created_at: string;
 }
@@ -70,6 +79,25 @@ export interface Payment {
   currency: PaymentCurrency;
   status: PaymentStatus;
   created_at: string;
+}
+
+export interface Reservation {
+  id: string;
+  payment_id: string;
+  account_id: string;
+  amount: string;
+  currency: PaymentCurrency;
+  status: ReservationStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export type FraudDecision = "APPROVED" | "REJECTED" | "REVIEW";
+
+export interface ApplyFraudDecisionParams {
+  paymentId: string;
+  decision: FraudDecision;
+  reason?: string;
 }
 
 export interface CreateAccountParams {
@@ -104,13 +132,23 @@ EXCEPTION
   WHEN duplicate_object THEN null;
 END $$;
 
+DO $$ BEGIN
+  CREATE TYPE reservation_status AS ENUM ('ACTIVE', 'CONSUMED', 'RELEASED');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
+
 -- 2. Accounts Table
 CREATE TABLE IF NOT EXISTS accounts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   balance DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+  reserved_balance DECIMAL(18,2) NOT NULL DEFAULT 0.00,
   currency payment_currency NOT NULL DEFAULT 'USD',
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Safe migration for existing accounts table: ensure reserved_balance exists
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS reserved_balance DECIMAL(18,2) NOT NULL DEFAULT 0.00;
 
 -- 3. Payments Table
 CREATE TABLE IF NOT EXISTS payments (
@@ -124,13 +162,26 @@ CREATE TABLE IF NOT EXISTS payments (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 4. Performance Indexes
+-- 4. Reservations Table
+CREATE TABLE IF NOT EXISTS reservations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  payment_id UUID NOT NULL UNIQUE REFERENCES payments(id),
+  account_id UUID NOT NULL REFERENCES accounts(id),
+  amount DECIMAL(18,2) NOT NULL CHECK (amount > 0),
+  currency payment_currency NOT NULL DEFAULT 'USD',
+  status reservation_status NOT NULL DEFAULT 'ACTIVE',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 5. Performance Indexes
 CREATE INDEX IF NOT EXISTS idx_payments_source ON payments(source_account_id);
 CREATE INDEX IF NOT EXISTS idx_payments_destination ON payments(destination_account_id);
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+CREATE INDEX IF NOT EXISTS idx_reservations_account_status ON reservations(account_id, status);
+CREATE INDEX IF NOT EXISTS idx_reservations_payment ON reservations(payment_id);
 
--- 5. Safe Migration for Existing Payments Table
--- Handles development databases without silently dropping or breaking existing records
+-- 6. Safe Migration for Existing Payments Table
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255);
 UPDATE payments SET idempotency_key = gen_random_uuid()::text WHERE idempotency_key IS NULL;
 ALTER TABLE payments ALTER COLUMN idempotency_key SET NOT NULL;
@@ -138,10 +189,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_idempotency_key ON payments(idemp
 `;
 
 /** 
- * Executes DDL queries to create accounts, payments tables, and enums.
+ * Executes DDL queries to create accounts, payments, reservations tables, and enums.
  */
 export async function initDatabase(): Promise<void> {
   await pool.query(SCHEMA_SQL);
+
+  // Extend payment_status ENUM safely with new fraud lifecycle statuses
+  const newStatuses = ["PENDING_FRAUD_CHECK", "FRAUD_REJECTED", "UNDER_REVIEW"];
+  for (const status of newStatuses) {
+    try {
+      await pool.query(`ALTER TYPE payment_status ADD VALUE IF NOT EXISTS '${status}'`);
+    } catch (_err) {
+      // Silently continue if already added
+    }
+  }
 }
 
 /**
@@ -185,7 +246,7 @@ export async function createAccount(params: CreateAccountParams): Promise<Accoun
   const result = await pool.query<Account>(
     `INSERT INTO accounts (balance, currency)
      VALUES ($1, $2)
-     RETURNING id, balance, currency, created_at`,
+     RETURNING id, balance, reserved_balance, currency, created_at`,
     [balance, currency]
   );
 
@@ -194,7 +255,7 @@ export async function createAccount(params: CreateAccountParams): Promise<Accoun
 
 export async function getAccountById(id: string): Promise<Account | null> {
   const result = await pool.query<Account>(
-    `SELECT id, balance, currency, created_at
+    `SELECT id, balance, reserved_balance, currency, created_at
      FROM accounts
      WHERE id = $1`,
     [id]
@@ -330,18 +391,16 @@ export async function executeTransferPayment(
 
     // 2. SELECT both account rows using SELECT ... FOR UPDATE in deterministic order
     const firstRes = await client.query<Account>(
-      "SELECT id, balance, currency, created_at FROM accounts WHERE id = $1 FOR UPDATE",
+      "SELECT id, balance, reserved_balance, currency, created_at FROM accounts WHERE id = $1 FOR UPDATE",
       [firstLockId]
     );
 
     const secondRes = await client.query<Account>(
-      "SELECT id, balance, currency, created_at FROM accounts WHERE id = $1 FOR UPDATE",
+      "SELECT id, balance, reserved_balance, currency, created_at FROM accounts WHERE id = $1 FOR UPDATE",
       [secondLockId]
     );
 
     // Re-check idempotency key after acquiring row locks.
-    // If two identical requests raced for the same accounts, Request 2 was paused waiting for row locks.
-    // Once Request 1 commits, Request 2 acquires the lock and will immediately see Request 1's payment!
     const postLockCheck = await client.query<Payment>(
       `SELECT id, idempotency_key, source_account_id, destination_account_id, amount, currency, status, created_at
        FROM payments
@@ -384,8 +443,8 @@ export async function executeTransferPayment(
       throw new TransferError(`Destination account '${destination_account_id}' not found`, 404);
     }
 
-    // 4. Validate that the source account has sufficient balance
-    const sourceBalance = Number(sourceAccount.balance);
+    // 4. Validate that the source account has sufficient available balance
+    const sourceBalance = Number(sourceAccount.balance) - Number(sourceAccount.reserved_balance || 0);
     if (sourceBalance < transferAmount) {
       throw new TransferError(
         `Insufficient balance: source account balance is ${sourceAccount.balance} ${sourceAccount.currency}, required ${transferAmount.toFixed(2)} ${currency}`,
@@ -508,4 +567,473 @@ export async function listPayments(limit = 20, offset = 0): Promise<Payment[]> {
   );
 
   return result.rows;
+}
+
+// ------------------------------------------------------------------------------
+// Reservation & Asynchronous Fraud Decision Functions
+// ------------------------------------------------------------------------------
+
+export async function getReservationByPaymentId(paymentId: string): Promise<Reservation | null> {
+  const result = await pool.query<Reservation>(
+    `SELECT id, payment_id, account_id, amount, currency, status, created_at, updated_at
+     FROM reservations
+     WHERE payment_id = $1`,
+    [paymentId]
+  );
+
+  return result.rows[0] || null;
+}
+
+/**
+ * Phase 1: Atomically creates a pending payment and reserves source account funds.
+ *
+ * Available balance check: (balance - reserved_balance) >= amount
+ * Status created: PENDING_FRAUD_CHECK
+ * Reservation status: ACTIVE
+ * Full multi-layer idempotency protection.
+ */
+export async function createPaymentWithReservation(
+  params: CreatePaymentParams
+): Promise<{ payment: Payment; reservation: Reservation }> {
+  const {
+    idempotency_key,
+    source_account_id,
+    destination_account_id,
+    amount,
+    currency,
+  } = params;
+
+  if (!idempotency_key || typeof idempotency_key !== "string" || idempotency_key.trim() === "") {
+    throw new TransferError("Idempotency key is required", 400);
+  }
+
+  const paymentAmount = Number(amount);
+
+  if (source_account_id === destination_account_id) {
+    throw new TransferError("Source and destination accounts cannot be the same", 400);
+  }
+
+  if (isNaN(paymentAmount) || paymentAmount <= 0) {
+    throw new TransferError("Payment amount must be greater than zero", 400);
+  }
+
+  // Pre-check: Fast path if payment with this idempotency key already exists
+  const existingPre = await getPaymentByIdempotencyKey(idempotency_key);
+  if (existingPre) {
+    const isMatch =
+      existingPre.source_account_id === source_account_id &&
+      existingPre.destination_account_id === destination_account_id &&
+      Number(existingPre.amount) === paymentAmount &&
+      existingPre.currency === currency;
+
+    if (isMatch) {
+      const reservation = await getReservationByPaymentId(existingPre.id);
+      return { payment: existingPre, reservation: reservation! };
+    } else {
+      throw new TransferError(
+        `Idempotency key conflict: '${idempotency_key}' was previously used with different payment parameters`,
+        409
+      );
+    }
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // In-transaction check: In case another transaction committed just before BEGIN
+    const txCheck = await client.query<Payment>(
+      `SELECT id, idempotency_key, source_account_id, destination_account_id, amount, currency, status, created_at
+       FROM payments
+       WHERE idempotency_key = $1`,
+      [idempotency_key]
+    );
+
+    if (txCheck.rows.length > 0) {
+      const existing = txCheck.rows[0];
+      await client.query("COMMIT");
+
+      const isMatch =
+        existing.source_account_id === source_account_id &&
+        existing.destination_account_id === destination_account_id &&
+        Number(existing.amount) === paymentAmount &&
+        existing.currency === currency;
+
+      if (isMatch) {
+        const resCheck = await pool.query<Reservation>(
+          `SELECT id, payment_id, account_id, amount, currency, status, created_at, updated_at
+           FROM reservations WHERE payment_id = $1`,
+          [existing.id]
+        );
+        return { payment: existing, reservation: resCheck.rows[0] };
+      } else {
+        throw new TransferError(
+          `Idempotency key conflict: '${idempotency_key}' was previously used with different payment parameters`,
+          409
+        );
+      }
+    }
+
+    // Lock source account with SELECT ... FOR UPDATE to check and modify available funds
+    const sourceRes = await client.query<Account>(
+      "SELECT id, balance, reserved_balance, currency, created_at FROM accounts WHERE id = $1 FOR UPDATE",
+      [source_account_id]
+    );
+
+    // Re-check idempotency key after acquiring row lock
+    const postLockCheck = await client.query<Payment>(
+      `SELECT id, idempotency_key, source_account_id, destination_account_id, amount, currency, status, created_at
+       FROM payments
+       WHERE idempotency_key = $1`,
+      [idempotency_key]
+    );
+
+    if (postLockCheck.rows.length > 0) {
+      const existing = postLockCheck.rows[0];
+      await client.query("ROLLBACK");
+
+      const isMatch =
+        existing.source_account_id === source_account_id &&
+        existing.destination_account_id === destination_account_id &&
+        Number(existing.amount) === paymentAmount &&
+        existing.currency === currency;
+
+      if (isMatch) {
+        const resCheck = await pool.query<Reservation>(
+          `SELECT id, payment_id, account_id, amount, currency, status, created_at, updated_at
+           FROM reservations WHERE payment_id = $1`,
+          [existing.id]
+        );
+        return { payment: existing, reservation: resCheck.rows[0] };
+      } else {
+        throw new TransferError(
+          `Idempotency key conflict: '${idempotency_key}' was previously used with different payment parameters`,
+          409
+        );
+      }
+    }
+
+    const sourceAccount = sourceRes.rows[0];
+    if (!sourceAccount) {
+      throw new TransferError(`Source account '${source_account_id}' not found`, 404);
+    }
+
+    // Verify destination account exists
+    const destRes = await client.query<Account>(
+      "SELECT id, balance, reserved_balance, currency, created_at FROM accounts WHERE id = $1",
+      [destination_account_id]
+    );
+    const destinationAccount = destRes.rows[0];
+    if (!destinationAccount) {
+      throw new TransferError(`Destination account '${destination_account_id}' not found`, 404);
+    }
+
+    // Validate currencies
+    if (sourceAccount.currency !== currency) {
+      throw new TransferError(
+        `Currency mismatch: source account currency is ${sourceAccount.currency}, payment currency is ${currency}`,
+        400
+      );
+    }
+    if (destinationAccount.currency !== currency) {
+      throw new TransferError(
+        `Currency mismatch: destination account currency is ${destinationAccount.currency}, payment currency is ${currency}`,
+        400
+      );
+    }
+
+    // Check available balance: balance - reserved_balance >= paymentAmount
+    const currentBalance = Number(sourceAccount.balance);
+    const currentReserved = Number(sourceAccount.reserved_balance || 0);
+    const availableBalance = currentBalance - currentReserved;
+
+    if (availableBalance < paymentAmount) {
+      throw new TransferError(
+        `Insufficient available balance: source account balance is ${currentBalance.toFixed(2)}, reserved is ${currentReserved.toFixed(2)} (available: ${availableBalance.toFixed(2)} ${sourceAccount.currency}), required ${paymentAmount.toFixed(2)} ${currency}`,
+        400
+      );
+    }
+
+    // 1. Hold funds: increment source account reserved_balance
+    await client.query(
+      "UPDATE accounts SET reserved_balance = reserved_balance + $1 WHERE id = $2",
+      [paymentAmount, source_account_id]
+    );
+
+    // 2. Insert payment with status 'PENDING_FRAUD_CHECK'
+    const paymentResult = await client.query<Payment>(
+      `INSERT INTO payments (
+         idempotency_key,
+         source_account_id,
+         destination_account_id,
+         amount,
+         currency,
+         status
+       )
+       VALUES ($1, $2, $3, $4, $5, 'PENDING_FRAUD_CHECK')
+       RETURNING id, idempotency_key, source_account_id, destination_account_id, amount, currency, status, created_at`,
+      [idempotency_key, source_account_id, destination_account_id, paymentAmount, currency]
+    );
+    const payment = paymentResult.rows[0];
+
+    // 3. Insert reservation record with status 'ACTIVE'
+    const reservationResult = await client.query<Reservation>(
+      `INSERT INTO reservations (
+         payment_id,
+         account_id,
+         amount,
+         currency,
+         status
+       )
+       VALUES ($1, $2, $3, $4, 'ACTIVE')
+       RETURNING id, payment_id, account_id, amount, currency, status, created_at, updated_at`,
+      [payment.id, source_account_id, paymentAmount, currency]
+    );
+    const reservation = reservationResult.rows[0];
+
+    await client.query("COMMIT");
+    return { payment, reservation };
+  } catch (error: any) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErr) {
+      console.error("[database] Failed to rollback transaction:", rollbackErr);
+    }
+
+    // Handle database-level UNIQUE constraint race condition (error code 23505)
+    if (
+      error.code === "23505" &&
+      (error.constraint?.includes("idempotency") || error.detail?.includes("idempotency_key"))
+    ) {
+      const existing = await getPaymentByIdempotencyKey(idempotency_key);
+      if (existing) {
+        const isMatch =
+          existing.source_account_id === source_account_id &&
+          existing.destination_account_id === destination_account_id &&
+          Number(existing.amount) === paymentAmount &&
+          existing.currency === currency;
+
+        if (isMatch) {
+          const resCheck = await pool.query<Reservation>(
+            `SELECT id, payment_id, account_id, amount, currency, status, created_at, updated_at
+             FROM reservations WHERE payment_id = $1`,
+            [existing.id]
+          );
+          return { payment: existing, reservation: resCheck.rows[0] };
+        } else {
+          throw new TransferError(
+            `Idempotency key conflict: '${idempotency_key}' was previously used with different payment parameters`,
+            409
+          );
+        }
+      }
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Phase 2: Resolves fraud decisions for held payments.
+ *
+ * Supported decisions:
+ * - APPROVED: Settles transfer, debits source balance, releases source reserved_balance,
+ *             credits destination balance, marks reservation CONSUMED, payment COMPLETED.
+ * - REJECTED: Releases source reserved_balance, marks reservation RELEASED, payment FRAUD_REJECTED.
+ * - REVIEW: Keeps funds reserved, marks payment UNDER_REVIEW.
+ *
+ * Guarantees idempotent decision delivery.
+ */
+export async function applyFraudDecision(
+  params: ApplyFraudDecisionParams
+): Promise<{ payment: Payment; reservation?: Reservation }> {
+  const { paymentId, decision, reason } = params;
+
+  if (!["APPROVED", "REJECTED", "REVIEW"].includes(decision)) {
+    throw new TransferError(`Invalid fraud decision '${decision}'. Allowed: APPROVED, REJECTED, REVIEW`, 400);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // 1. Lock payment row
+    const paymentRes = await client.query<Payment>(
+      `SELECT id, idempotency_key, source_account_id, destination_account_id, amount, currency, status, created_at
+       FROM payments
+       WHERE id = $1
+       FOR UPDATE`,
+      [paymentId]
+    );
+
+    if (paymentRes.rows.length === 0) {
+      throw new TransferError(`Payment '${paymentId}' not found`, 404);
+    }
+
+    const payment = paymentRes.rows[0];
+
+    // Idempotency check: If already finalized with same decision, safely return current state
+    if (payment.status === "COMPLETED") {
+      if (decision === "APPROVED") {
+        await client.query("COMMIT");
+        const resCheck = await pool.query<Reservation>(
+          "SELECT id, payment_id, account_id, amount, currency, status, created_at, updated_at FROM reservations WHERE payment_id = $1",
+          [paymentId]
+        );
+        return { payment, reservation: resCheck.rows[0] };
+      } else {
+        throw new TransferError(
+          `Conflict: Payment '${paymentId}' is already COMPLETED and cannot be transitioned to ${decision}`,
+          409
+        );
+      }
+    }
+
+    if (payment.status === "FRAUD_REJECTED") {
+      if (decision === "REJECTED") {
+        await client.query("COMMIT");
+        const resCheck = await pool.query<Reservation>(
+          "SELECT id, payment_id, account_id, amount, currency, status, created_at, updated_at FROM reservations WHERE payment_id = $1",
+          [paymentId]
+        );
+        return { payment, reservation: resCheck.rows[0] };
+      } else {
+        throw new TransferError(
+          `Conflict: Payment '${paymentId}' is already FRAUD_REJECTED and cannot be transitioned to ${decision}`,
+          409
+        );
+      }
+    }
+
+    // Only payments in PENDING_FRAUD_CHECK or UNDER_REVIEW can receive decisions
+    if (payment.status !== "PENDING_FRAUD_CHECK" && payment.status !== "UNDER_REVIEW") {
+      throw new TransferError(
+        `Payment '${paymentId}' cannot receive a fraud decision because its current status is '${payment.status}'`,
+        400
+      );
+    }
+
+    // 2. Lock reservation row
+    const resRes = await client.query<Reservation>(
+      `SELECT id, payment_id, account_id, amount, currency, status, created_at, updated_at
+       FROM reservations
+       WHERE payment_id = $1
+       FOR UPDATE`,
+      [paymentId]
+    );
+
+    if (resRes.rows.length === 0) {
+      throw new TransferError(`No reservation record found for payment '${paymentId}'`, 404);
+    }
+
+    const reservation = resRes.rows[0];
+    if (reservation.status !== "ACTIVE") {
+      throw new TransferError(
+        `Reservation for payment '${paymentId}' is not ACTIVE (current status: ${reservation.status})`,
+        400
+      );
+    }
+
+    const transferAmount = Number(payment.amount);
+
+    // 3. Process based on decision
+    if (decision === "APPROVED") {
+      // Deterministic lock order on accounts (smaller UUID first)
+      const [firstLockId, secondLockId] =
+        payment.source_account_id < payment.destination_account_id
+          ? [payment.source_account_id, payment.destination_account_id]
+          : [payment.destination_account_id, payment.source_account_id];
+
+      await client.query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE", [firstLockId]);
+      await client.query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE", [secondLockId]);
+
+      // Deduct from source balance and release reserved_balance hold
+      await client.query(
+        "UPDATE accounts SET balance = balance - $1, reserved_balance = reserved_balance - $1 WHERE id = $2",
+        [transferAmount, payment.source_account_id]
+      );
+
+      // Credit destination balance
+      await client.query(
+        "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+        [transferAmount, payment.destination_account_id]
+      );
+
+      // Mark reservation CONSUMED
+      const updatedRes = await client.query<Reservation>(
+        `UPDATE reservations
+         SET status = 'CONSUMED', updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, payment_id, account_id, amount, currency, status, created_at, updated_at`,
+        [reservation.id]
+      );
+
+      // Mark payment COMPLETED
+      const updatedPayment = await client.query<Payment>(
+        `UPDATE payments
+         SET status = 'COMPLETED'
+         WHERE id = $1
+         RETURNING id, idempotency_key, source_account_id, destination_account_id, amount, currency, status, created_at`,
+        [payment.id]
+      );
+
+      await client.query("COMMIT");
+      return { payment: updatedPayment.rows[0], reservation: updatedRes.rows[0] };
+    } else if (decision === "REJECTED") {
+      // Lock source account to release reserved_balance hold
+      await client.query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE", [payment.source_account_id]);
+
+      await client.query(
+        "UPDATE accounts SET reserved_balance = reserved_balance - $1 WHERE id = $2",
+        [transferAmount, payment.source_account_id]
+      );
+
+      // Mark reservation RELEASED
+      const updatedRes = await client.query<Reservation>(
+        `UPDATE reservations
+         SET status = 'RELEASED', updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, payment_id, account_id, amount, currency, status, created_at, updated_at`,
+        [reservation.id]
+      );
+
+      // Mark payment FRAUD_REJECTED
+      const updatedPayment = await client.query<Payment>(
+        `UPDATE payments
+         SET status = 'FRAUD_REJECTED'
+         WHERE id = $1
+         RETURNING id, idempotency_key, source_account_id, destination_account_id, amount, currency, status, created_at`,
+        [payment.id]
+      );
+
+      await client.query("COMMIT");
+      return { payment: updatedPayment.rows[0], reservation: updatedRes.rows[0] };
+    } else {
+      // Decision is "REVIEW"
+      // Reservation remains ACTIVE; payment is marked UNDER_REVIEW
+      const updatedPayment = await client.query<Payment>(
+        `UPDATE payments
+         SET status = 'UNDER_REVIEW'
+         WHERE id = $1
+         RETURNING id, idempotency_key, source_account_id, destination_account_id, amount, currency, status, created_at`,
+        [payment.id]
+      );
+
+      await client.query("COMMIT");
+      return { payment: updatedPayment.rows[0], reservation };
+    }
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErr) {
+      console.error("[database] Failed to rollback fraud decision transaction:", rollbackErr);
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 }

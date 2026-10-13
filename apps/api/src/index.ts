@@ -17,12 +17,16 @@ import {
   closeDatabaseConnection,
   createPayment,
   executeTransferPayment,
+  createPaymentWithReservation,
+  applyFraudDecision,
+  getReservationByPaymentId,
   TransferError,
   getPaymentById,
   listPayments,
   createAccount,
   getAccountById,
   PaymentCurrency,
+  FraudDecision,
 } from "@payment/database";
 
 const app = express();
@@ -70,7 +74,7 @@ app.get("/health/db", async (_req: Request, res: Response) => {
 });
 
 // ------------------------------------------------------------------------------
-// Account Endpoints (Helper to create accounts for payment testing)
+// Account Endpoints
 // ------------------------------------------------------------------------------
 
 /**
@@ -123,14 +127,14 @@ app.get("/accounts/:id", async (req: Request, res: Response) => {
 });
 
 // ------------------------------------------------------------------------------
-// Payment Endpoints
+// Payment Endpoints (Two-Phase Flow: Reserve Funds -> Fraud Decision)
 // ------------------------------------------------------------------------------
 
 /**
- * POST /payments
- * Creates a new payment between source and destination accounts.
+ * Handler for creating a payment with fund reservation.
+ * Supports both POST /payments and alias POST /payment.
  */
-app.post("/payments", async (req: Request, res: Response) => {
+async function handleCreatePayment(req: Request, res: Response) {
   try {
     const idempotencyKey = req.header("Idempotency-Key");
 
@@ -146,7 +150,6 @@ app.post("/payments", async (req: Request, res: Response) => {
       currency = "USD",
     } = req.body;
 
-    // 1. Validate required fields
     // 2. Validate required request body fields
     if (!source_account_id || typeof source_account_id !== "string") {
       return res.status(400).json({ error: "source_account_id is required" });
@@ -175,38 +178,16 @@ app.post("/payments", async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Verify both accounts exist in database
-    const [sourceAccount, destinationAccount] = await Promise.all([
-      getAccountById(source_account_id),
-      getAccountById(destination_account_id),
-    ]);
-
-    if (!sourceAccount) {
-      return res.status(404).json({
-        error: `Source account '${source_account_id}' does not exist`,
-      });
-    }
-
-    if (!destinationAccount) {
-      return res.status(404).json({
-        error: `Destination account '${destination_account_id}' does not exist`,
-      });
-    }
-
-    // 2. Execute atomic transfer transaction (deterministic locking, validations, balance mutations, COMPLETED status)
-    // 3. Execute atomic transfer with idempotency protection
-    const payment = await executeTransferPayment({
+    // 3. Two-phase flow: Create payment with status PENDING_FRAUD_CHECK and hold funds
+    const { payment, reservation } = await createPaymentWithReservation({
       idempotency_key: idempotencyKey.trim(),
       source_account_id,
       destination_account_id,
       amount: numericAmount,
       currency,
-      status: "PENDING",
     });
 
-    console.log(`[api] Payment created: ${payment.id} (${payment.amount} ${payment.currency})`);
-    console.log(`[api] Payment completed atomically: ${payment.id} (${payment.amount} ${payment.currency})`);
-    console.log(`[api] Payment processed: ${payment.id} (Idempotency-Key: ${payment.idempotency_key}, Amount: ${payment.amount} ${payment.currency})`);
+    console.log(`[api] Payment reserved: ${payment.id} (Status: ${payment.status}, Reserved: ${reservation.amount} ${reservation.currency})`);
     return res.status(201).json(payment);
   } catch (error) {
     if (error instanceof TransferError) {
@@ -215,7 +196,74 @@ app.post("/payments", async (req: Request, res: Response) => {
     console.error("[api] Error creating payment:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
-});
+}
+
+app.post("/payments", handleCreatePayment);
+app.post("/payment", handleCreatePayment); // Friendly alias for singular path
+
+/**
+ * Handler for applying fraud decisions (APPROVED, REJECTED, REVIEW).
+ * Supports both /payments/:id/fraud-decision and aliases like /payments/:id/fraud.
+ */
+async function handleFraudDecision(req: Request, res: Response) {
+  try {
+    const { id } = req.params;
+    const { decision, reason } = req.body;
+
+    if (!decision || typeof decision !== "string") {
+      return res.status(400).json({
+        error: "decision is required ('APPROVED', 'REJECTED', 'REVIEW')",
+      });
+    }
+
+    const upperDecision = decision.toUpperCase() as FraudDecision;
+    if (!["APPROVED", "REJECTED", "REVIEW"].includes(upperDecision)) {
+      return res.status(400).json({
+        error: `Invalid decision '${decision}'. Allowed: APPROVED, REJECTED, REVIEW`,
+      });
+    }
+
+    const result = await applyFraudDecision({
+      paymentId: id,
+      decision: upperDecision,
+      reason,
+    });
+
+    console.log(`[api] Fraud decision applied: ${id} -> ${upperDecision} (Payment Status: ${result.payment.status})`);
+    return res.status(200).json(result);
+  } catch (error) {
+    if (error instanceof TransferError) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
+    console.error("[api] Error applying fraud decision:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+}
+
+app.post("/payments/:id/fraud-decision", handleFraudDecision);
+app.post("/payments/:id/fraud", handleFraudDecision); // Friendly alias
+app.post("/payment/:id/fraud-decision", handleFraudDecision); // Friendly alias
+app.post("/payment/:id/fraud", handleFraudDecision); // Friendly alias
+
+/**
+ * GET /payments/:id/reservation
+ * Fetches fund reservation details for a payment.
+ */
+async function handleGetReservation(req: Request, res: Response) {
+  try {
+    const reservation = await getReservationByPaymentId(req.params.id);
+    if (!reservation) {
+      return res.status(404).json({ error: "Reservation not found" });
+    }
+    return res.status(200).json(reservation);
+  } catch (error) {
+    console.error("[api] Error retrieving reservation:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+}
+
+app.get("/payments/:id/reservation", handleGetReservation);
+app.get("/payment/:id/reservation", handleGetReservation);
 
 /**
  * GET /payments/:id
@@ -271,7 +319,7 @@ const server = app.listen(PORT, async () => {
     console.log(`[api] Connected to PostgreSQL (Time: ${dbCheck.timestamp})`);
     try {
       await initDatabase();
-      console.log("[api] Database tables (accounts, payments) initialized successfully.");
+      console.log("[api] Database tables (accounts, payments, reservations) initialized successfully.");
     } catch (initErr) {
       console.error("[api] Failed to initialize database tables:", initErr);
     }
