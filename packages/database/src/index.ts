@@ -5,6 +5,7 @@
 import { Pool, PoolConfig } from "pg";
 import dotenv from "dotenv";
 import path from "path";
+import crypto from "crypto";
 
 // Ensure environment variables are loaded
 dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
@@ -92,6 +93,16 @@ export interface Reservation {
   updated_at: string;
 }
 
+export interface OutboxEvent {
+  id: string;
+  event_type: string;
+  aggregate_id: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+  published_at: string | null;
+  attempts: number;
+}
+
 export type FraudDecision = "APPROVED" | "REJECTED" | "REVIEW";
 
 export interface ApplyFraudDecisionParams {
@@ -174,14 +185,31 @@ CREATE TABLE IF NOT EXISTS reservations (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 5. Performance Indexes
+-- 5. Outbox Events Table (Transactional Outbox Pattern)
+CREATE TABLE IF NOT EXISTS outbox_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_type VARCHAR(255) NOT NULL,
+  aggregate_id UUID NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  published_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0
+);
+
+-- Safe migrations in case table was partially created in past
+ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS published_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;
+
+-- 6. Performance Indexes
 CREATE INDEX IF NOT EXISTS idx_payments_source ON payments(source_account_id);
 CREATE INDEX IF NOT EXISTS idx_payments_destination ON payments(destination_account_id);
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
 CREATE INDEX IF NOT EXISTS idx_reservations_account_status ON reservations(account_id, status);
 CREATE INDEX IF NOT EXISTS idx_reservations_payment ON reservations(payment_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_events_unpublished ON outbox_events(created_at ASC) WHERE published_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_outbox_events_aggregate_id ON outbox_events(aggregate_id);
 
--- 6. Safe Migration for Existing Payments Table
+-- 7. Safe Migration for Existing Payments Table
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255);
 UPDATE payments SET idempotency_key = gen_random_uuid()::text WHERE idempotency_key IS NULL;
 ALTER TABLE payments ALTER COLUMN idempotency_key SET NOT NULL;
@@ -594,7 +622,7 @@ export async function getReservationByPaymentId(paymentId: string): Promise<Rese
  */
 export async function createPaymentWithReservation(
   params: CreatePaymentParams
-): Promise<{ payment: Payment; reservation: Reservation }> {
+): Promise<{ payment: Payment; reservation: Reservation; outboxEvent?: OutboxEvent }> {
   const {
     idempotency_key,
     source_account_id,
@@ -628,7 +656,8 @@ export async function createPaymentWithReservation(
 
     if (isMatch) {
       const reservation = await getReservationByPaymentId(existingPre.id);
-      return { payment: existingPre, reservation: reservation! };
+      const outboxEvents = await getOutboxEventsByAggregateId(existingPre.id);
+      return { payment: existingPre, reservation: reservation!, outboxEvent: outboxEvents[0] };
     } else {
       throw new TransferError(
         `Idempotency key conflict: '${idempotency_key}' was previously used with different payment parameters`,
@@ -666,7 +695,12 @@ export async function createPaymentWithReservation(
            FROM reservations WHERE payment_id = $1`,
           [existing.id]
         );
-        return { payment: existing, reservation: resCheck.rows[0] };
+        const outboxCheck = await pool.query<OutboxEvent>(
+          `SELECT id, event_type, aggregate_id, payload, created_at, published_at, attempts
+           FROM outbox_events WHERE aggregate_id = $1`,
+          [existing.id]
+        );
+        return { payment: existing, reservation: resCheck.rows[0], outboxEvent: outboxCheck.rows[0] };
       } else {
         throw new TransferError(
           `Idempotency key conflict: '${idempotency_key}' was previously used with different payment parameters`,
@@ -705,7 +739,12 @@ export async function createPaymentWithReservation(
            FROM reservations WHERE payment_id = $1`,
           [existing.id]
         );
-        return { payment: existing, reservation: resCheck.rows[0] };
+        const outboxCheck = await pool.query<OutboxEvent>(
+          `SELECT id, event_type, aggregate_id, payload, created_at, published_at, attempts
+           FROM outbox_events WHERE aggregate_id = $1`,
+          [existing.id]
+        );
+        return { payment: existing, reservation: resCheck.rows[0], outboxEvent: outboxCheck.rows[0] };
       } else {
         throw new TransferError(
           `Idempotency key conflict: '${idempotency_key}' was previously used with different payment parameters`,
@@ -792,8 +831,50 @@ export async function createPaymentWithReservation(
     );
     const reservation = reservationResult.rows[0];
 
+    // 4. Insert transactional outbox event (PaymentCreated) in the same transaction
+    const outboxEventId = crypto.randomUUID();
+    const eventTimestamp = new Date().toISOString();
+    const eventPayload = {
+      paymentId: payment.id,
+      sourceAccountId: payment.source_account_id,
+      destinationAccountId: payment.destination_account_id,
+      amount: payment.amount,
+      currency: payment.currency,
+      status: payment.status,
+    };
+
+    const outboxEnvelope = {
+      eventId: outboxEventId,
+      eventType: "PaymentCreated",
+      aggregateId: payment.id,
+      timestamp: eventTimestamp,
+      version: 1,
+      payload: eventPayload,
+      paymentId: payment.id,
+      sourceAccountId: payment.source_account_id,
+      destinationAccountId: payment.destination_account_id,
+      amount: payment.amount,
+      currency: payment.currency,
+      status: payment.status,
+    };
+
+    const outboxResult = await client.query<OutboxEvent>(
+      `INSERT INTO outbox_events (
+         id,
+         event_type,
+         aggregate_id,
+         payload,
+         published_at,
+         attempts
+       )
+       VALUES ($1, $2, $3, $4, NULL, 0)
+       RETURNING id, event_type, aggregate_id, payload, created_at, published_at, attempts`,
+      [outboxEventId, "PaymentCreated", payment.id, JSON.stringify(outboxEnvelope)]
+    );
+    const outboxEvent = outboxResult.rows[0];
+
     await client.query("COMMIT");
-    return { payment, reservation };
+    return { payment, reservation, outboxEvent };
   } catch (error: any) {
     try {
       await client.query("ROLLBACK");
@@ -820,7 +901,12 @@ export async function createPaymentWithReservation(
              FROM reservations WHERE payment_id = $1`,
             [existing.id]
           );
-          return { payment: existing, reservation: resCheck.rows[0] };
+          const outboxCheck = await pool.query<OutboxEvent>(
+            `SELECT id, event_type, aggregate_id, payload, created_at, published_at, attempts
+             FROM outbox_events WHERE aggregate_id = $1`,
+            [existing.id]
+          );
+          return { payment: existing, reservation: resCheck.rows[0], outboxEvent: outboxCheck.rows[0] };
         } else {
           throw new TransferError(
             `Idempotency key conflict: '${idempotency_key}' was previously used with different payment parameters`,
@@ -1036,4 +1122,74 @@ export async function applyFraudDecision(
   } finally {
     client.release();
   }
+}
+
+// ------------------------------------------------------------------------------
+// Outbox Query & Update Utilities
+// ------------------------------------------------------------------------------
+
+/**
+ * Retrieves unpublished outbox events in chronological order (FIFO).
+ * Uses the partial index on (created_at ASC) WHERE published_at IS NULL.
+ */
+export async function getUnpublishedOutboxEvents(
+  limit: number = 50
+): Promise<OutboxEvent[]> {
+  const result = await pool.query<OutboxEvent>(
+    `SELECT id, event_type, aggregate_id, payload, created_at, published_at, attempts
+     FROM outbox_events
+     WHERE published_at IS NULL
+     ORDER BY created_at ASC
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows;
+}
+
+/**
+ * Retrieves all outbox events associated with a specific aggregate ID (e.g., paymentId).
+ */
+export async function getOutboxEventsByAggregateId(
+  aggregateId: string
+): Promise<OutboxEvent[]> {
+  const result = await pool.query<OutboxEvent>(
+    `SELECT id, event_type, aggregate_id, payload, created_at, published_at, attempts
+     FROM outbox_events
+     WHERE aggregate_id = $1
+     ORDER BY created_at ASC`,
+    [aggregateId]
+  );
+  return result.rows;
+}
+
+/**
+ * Marks an outbox event as successfully published by setting published_at = NOW().
+ */
+export async function markOutboxEventPublished(
+  id: string
+): Promise<OutboxEvent | null> {
+  const result = await pool.query<OutboxEvent>(
+    `UPDATE outbox_events
+     SET published_at = NOW()
+     WHERE id = $1
+     RETURNING id, event_type, aggregate_id, payload, created_at, published_at, attempts`,
+    [id]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Increments publication retry attempts for an outbox event.
+ */
+export async function incrementOutboxEventAttempts(
+  id: string
+): Promise<OutboxEvent | null> {
+  const result = await pool.query<OutboxEvent>(
+    `UPDATE outbox_events
+     SET attempts = attempts + 1
+     WHERE id = $1
+     RETURNING id, event_type, aggregate_id, payload, created_at, published_at, attempts`,
+    [id]
+  );
+  return result.rows[0] || null;
 }
